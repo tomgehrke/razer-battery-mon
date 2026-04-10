@@ -34,7 +34,7 @@ import pystray
 # ============================================================================
 
 DEFAULT_ALERT_THRESHOLD = 30        # percent — fires toast at or below this
-DEFAULT_POLL_INTERVAL   = 2         # seconds between log checks
+DEFAULT_POLL_INTERVAL   = 60        # seconds between log checks
 DEFAULT_ALERT_COOLDOWN  = 300       # seconds before re-alerting (5 min)
 DEFAULT_SYNAPSE_VERSION = "auto"    # "3", "4", or "auto"
 APP_NAME                = "Razer Battery Monitor"
