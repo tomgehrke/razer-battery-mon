@@ -46,6 +46,24 @@ def create_startup_shortcut():
     print(f"  Will run: {pythonw} {script_path}\n")
 
 
+def create_start_menu_shortcut():
+    """Create a Start Menu Programs entry so the monitor is searchable by name."""
+    programs = Path(os.getenv("APPDATA")) / "Microsoft/Windows/Start Menu/Programs"
+    script_path = Path(__file__).parent.resolve() / "battery_monitor.pyw"
+    pythonw = Path(sys.executable).parent / "pythonw.exe"
+    if not pythonw.exists():
+        pythonw = Path(sys.executable)
+
+    vbs_path = programs / "Razer Battery Monitor.vbs"
+    vbs_content = (
+        f'Set WshShell = CreateObject("WScript.Shell")\n'
+        f'WshShell.Run """{pythonw}"" ""{script_path}""", 0, False\n'
+    )
+    vbs_path.write_text(vbs_content, encoding="utf-8")
+    print(f"Start Menu entry created: {vbs_path}")
+    print("  Search 'Razer Battery Monitor' in Start Menu to launch.\n")
+
+
 def remove_startup_shortcut():
     startup = Path(os.getenv("APPDATA")) / "Microsoft/Windows/Start Menu/Programs/Startup"
     vbs_path = startup / "RazerBatteryMonitor.vbs"
@@ -64,12 +82,20 @@ def main():
     print("Would you like the monitor to start automatically at login?")
     choice = input("  [Y]es / [N]o / [R]emove existing: ").strip().lower()
 
+    added_start_menu = False
     if choice in ("y", "yes"):
         create_startup_shortcut()
+        create_start_menu_shortcut()
+        added_start_menu = True
     elif choice in ("r", "remove"):
         remove_startup_shortcut()
     else:
         print("Skipped startup shortcut.\n")
+
+    if not added_start_menu:
+        print("Would you like a Start Menu entry so you can relaunch it by name?")
+        if input("  [Y]es / [N]o: ").strip().lower() in ("y", "yes"):
+            create_start_menu_shortcut()
 
     print("Setup complete. To run now:")
     print(f"  pythonw {Path(__file__).parent / 'battery_monitor.pyw'}")

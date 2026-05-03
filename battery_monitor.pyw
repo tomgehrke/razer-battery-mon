@@ -35,7 +35,7 @@ import pystray
 
 DEFAULT_ALERT_THRESHOLD = 30        # percent — fires toast at or below this
 DEFAULT_POLL_INTERVAL   = 60        # seconds between log checks
-DEFAULT_ALERT_COOLDOWN  = 300       # seconds before re-alerting (5 min)
+DEFAULT_ALERT_STEPS     = 5         # number of evenly-spaced notifications per discharge cycle
 DEFAULT_SYNAPSE_VERSION = "auto"    # "3", "4", or "auto"
 APP_NAME                = "Razer Battery Monitor"
 APP_ID                  = "RazerBatteryMonitor"
@@ -235,9 +235,9 @@ def parse_devices_from_text(text: str) -> list[dict]:
     return [last] if last else []
 
 
-def read_all_statuses(log_path: Path) -> list[dict]:
+def read_all_statuses(log_path: Path | None) -> list[dict]:
     """Read the tail of the log file and return battery status for all devices."""
-    if not log_path.exists():
+    if not log_path or not log_path.exists():
         return []
     try:
         file_size = log_path.stat().st_size
@@ -249,6 +249,41 @@ def read_all_statuses(log_path: Path) -> list[dict]:
     except Exception as e:
         log.warning(f"Error reading log: {e}")
     return []
+
+# ============================================================================
+# START MENU SHORTCUT
+# ============================================================================
+
+def _make_start_menu_shortcut() -> bool:
+    """Create a Start Menu shortcut (.lnk) to launch the monitor. Returns True on success."""
+    programs = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs"
+    lnk = programs / "Razer Battery Monitor.lnk"
+    script = Path(__file__).resolve()
+    pythonw = Path(sys.executable).parent / "pythonw.exe"
+    if not pythonw.exists():
+        pythonw = Path(sys.executable)
+
+    ps = "; ".join([
+        "$s = New-Object -ComObject WScript.Shell",
+        f'$l = $s.CreateShortcut("{lnk}")',
+        f'$l.TargetPath = "{pythonw}"',
+        f"$l.Arguments = '`\"{script}`\"'",
+        '$l.Description = "Razer Battery Monitor"',
+        f'$l.WorkingDirectory = "{script.parent}"',
+        "$l.Save()",
+    ])
+    try:
+        r = subprocess.run(
+            ["powershell", "-NonInteractive", "-NoProfile", "-Command", ps],
+            capture_output=True, timeout=15,
+        )
+        if r.returncode == 0:
+            log.info(f"Start Menu shortcut created: {lnk}")
+            return True
+        log.warning(f"Shortcut creation failed: {r.stderr.decode(errors='replace')}")
+    except Exception as e:
+        log.warning(f"Could not create Start Menu shortcut: {e}")
+    return False
 
 # ============================================================================
 # ICON RENDERING
@@ -375,31 +410,31 @@ class IconRenderer:
 
 class AlertManager:
     """
-    Fires a Windows toast notification when battery drops to/below threshold.
-    Debounces so you only get alerted once per discharge cycle — it resets
-    when the battery goes back above the threshold (i.e., you charged it).
+    Fires Windows toast notifications as battery steps down through evenly-spaced
+    thresholds. With threshold=30 and steps=5, alerts fire at 30, 24, 18, 12, 6.
+    All fired levels reset when the battery rises back above the top threshold
+    (i.e., you charged it).
     """
 
-    def __init__(self, threshold: int, cooldown: int, device_name: str = ""):
-        self.threshold = threshold
-        self.cooldown = cooldown
+    def __init__(self, threshold: int, steps: int, device_name: str = ""):
         self.device_name = device_name
-        self._alerted = False      # have we fired for this discharge cycle?
-        self._last_alert = 0.0     # timestamp of last alert
+        step_size = max(1, threshold // steps)
+        # e.g. threshold=30, steps=5 → [30, 24, 18, 12, 6]
+        self._levels = [threshold - i * step_size for i in range(steps)]
+        self._levels = [lvl for lvl in self._levels if lvl > 0]
+        self._fired: set[int] = set()   # levels already alerted this cycle
 
     def check(self, percent: int, charging: bool):
-        # Reset alert state when charging or back above threshold
-        if charging or percent > self.threshold:
-            self._alerted = False
+        # Reset when charging or back above the top threshold
+        if charging or percent > self._levels[0]:
+            self._fired.clear()
             return
 
-        # Fire if at/below threshold and haven't alerted this cycle
-        if percent <= self.threshold and not self._alerted:
-            now = time.time()
-            if now - self._last_alert >= self.cooldown:
+        for lvl in self._levels:
+            if percent <= lvl and lvl not in self._fired:
                 self._fire(percent)
-                self._alerted = True
-                self._last_alert = now
+                self._fired.add(lvl)
+                break   # only one notification per poll tick
 
     def _fire(self, percent: int):
         title = f"{self.device_name} Battery Low" if self.device_name else "Wireless Device Battery Low"
@@ -432,10 +467,13 @@ class AlertManager:
 # LOG WATCHER (poll-based)
 # ============================================================================
 
-def watch_log(log_path: Path, poll_interval: float, callback):
+def watch_log(get_log_path, poll_interval: float, callback):
     """
     Periodically read the tail of the log file and fire the callback when
     the battery status changes for any device.
+
+    `get_log_path` is a callable that returns the current log Path (or None).
+    Calling it on every poll handles Synapse log rotation transparently.
 
     Poll-based instead of line-tailing because the JSON powerStatus blocks
     span multiple lines, making readline()-based tailing unreliable.
@@ -445,7 +483,7 @@ def watch_log(log_path: Path, poll_interval: float, callback):
 
     while True:
         try:
-            statuses = read_all_statuses(log_path)
+            statuses = read_all_statuses(get_log_path())
             statuses_by_name = {s["device"]: s for s in statuses}
             if statuses_by_name != last_statuses:
                 last_statuses = statuses_by_name
@@ -465,11 +503,11 @@ def watch_log(log_path: Path, poll_interval: float, callback):
 class DeviceIcon:
     """Manages a single system tray icon for one Razer device."""
 
-    def __init__(self, device_name: str, threshold: int, cooldown: int,
+    def __init__(self, device_name: str, threshold: int, steps: int,
                  renderer: IconRenderer, on_quit):
         self.device_name = device_name
         self.status = {"device": device_name, "percent": None, "charging": False}
-        self.alert_mgr = AlertManager(threshold, cooldown, device_name)
+        self.alert_mgr = AlertManager(threshold, steps, device_name)
         self._renderer = renderer
         self._on_quit = on_quit
 
@@ -496,6 +534,11 @@ class DeviceIcon:
                 lambda item: "Charging" if self.status["charging"] else "Discharging",
                 action=None,
                 enabled=False,
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Create Start Menu Shortcut",
+                lambda *_: _make_start_menu_shortcut(),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", lambda *_: self._on_quit()),
@@ -527,7 +570,7 @@ class BatteryTrayApp:
         self.log_path, self.synapse_version = resolve_log_path(args.synapse)
         self.threshold      = args.threshold
         self.poll_interval  = args.poll_interval
-        self.alert_cooldown = args.alert_cooldown
+        self.alert_steps    = args.alert_steps
         self.renderer       = IconRenderer()
         self._device_icons: dict[str, DeviceIcon] = {}
         self._stop_event    = threading.Event()
@@ -546,11 +589,19 @@ class BatteryTrayApp:
             if "__waiting__" in self._device_icons and statuses:
                 self._device_icons.pop("__waiting__").stop()
 
+            if statuses:
+                # Remove icons for devices no longer reported in the log
+                # (handles log rotation where a different file has fewer devices)
+                current_names = {s["device"] for s in statuses}
+                for name in [n for n in list(self._device_icons) if n not in current_names]:
+                    self._device_icons.pop(name).stop()
+                    log.info(f"Removed stale device icon: {name}")
+
             for status in statuses:
                 name = status["device"]
                 if name not in self._device_icons:
                     di = DeviceIcon(
-                        name, self.threshold, self.alert_cooldown,
+                        name, self.threshold, self.alert_steps,
                         self.renderer, self._quit_all,
                     )
                     self._device_icons[name] = di
@@ -559,7 +610,15 @@ class BatteryTrayApp:
                 self._device_icons[name].update(status)
 
     def run(self):
-        initial = read_all_statuses(self.log_path)
+        # Build a callable so the watcher always reads the current log file.
+        # Synapse 4 rotates logs; re-resolving on each poll picks up the new file.
+        if self.synapse_version == "4":
+            get_log_path = find_synapse4_log
+        else:
+            _fixed = self.log_path
+            get_log_path = lambda: _fixed
+
+        initial = read_all_statuses(get_log_path())
         if initial:
             log.info(f"Found {len(initial)} device(s) with battery info")
             self._update(initial)
@@ -567,7 +626,7 @@ class BatteryTrayApp:
             log.info("No initial battery data found, waiting for log updates...")
             # Show a placeholder so there's something visible in the tray
             waiting = DeviceIcon(
-                "Razer Monitor", self.threshold, self.alert_cooldown,
+                "Razer Monitor", self.threshold, self.alert_steps,
                 self.renderer, self._quit_all,
             )
             self._device_icons["__waiting__"] = waiting
@@ -576,7 +635,7 @@ class BatteryTrayApp:
         # Start log watcher in background thread
         watcher = threading.Thread(
             target=watch_log,
-            args=(self.log_path, self.poll_interval, self._update),
+            args=(get_log_path, self.poll_interval, self._update),
             daemon=True,
         )
         watcher.start()
@@ -614,8 +673,8 @@ def main():
         help=f"Seconds between log file checks (default: {DEFAULT_POLL_INTERVAL})",
     )
     parser.add_argument(
-        "--alert-cooldown", type=int, default=DEFAULT_ALERT_COOLDOWN,
-        help=f"Minimum seconds between repeated alerts (default: {DEFAULT_ALERT_COOLDOWN})",
+        "--alert-steps", type=int, default=DEFAULT_ALERT_STEPS,
+        help=f"Number of evenly-spaced notifications per discharge cycle (default: {DEFAULT_ALERT_STEPS})",
     )
     parser.add_argument(
         "--synapse", choices=["3", "4", "auto"], default=DEFAULT_SYNAPSE_VERSION,
@@ -632,8 +691,8 @@ def main():
         parser.error("--threshold must be between 0 and 100")
     if args.poll_interval <= 0:
         parser.error("--poll-interval must be greater than 0")
-    if args.alert_cooldown < 0:
-        parser.error("--alert-cooldown must be >= 0")
+    if args.alert_steps < 1:
+        parser.error("--alert-steps must be >= 1")
 
     # Configure logging
     level = logging.DEBUG if args.debug else logging.INFO
